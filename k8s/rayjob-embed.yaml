@@ -1,0 +1,98 @@
+# RayJob for GPU-accelerated embedding generation
+# Run this AFTER tokenization completes (rayjob-toy.yaml)
+#
+# Prerequisites:
+#   - NVIDIA device plugin installed
+#   - GPU nodes configured with nvidia-container-toolkit
+#   - Tokenization job completed (tokens in /output/tokens/)
+#
+# Usage:
+#   kubectl apply -n wiki-tokenizer -f k8s/rayjob-embed.yaml
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: wiki-rayjob-embed
+  namespace: wiki-tokenizer
+spec:
+  entrypoint: >
+    python -m ray_app.embed_wiki
+    --input-dir /output/tokens
+    --output-dir /output/embeddings
+    --model all-MiniLM-L6-v2
+    --checkpoint /output/embed_checkpoint.json
+    --batch-size 10
+    --concurrency 3
+  runtimeEnvYAML: |
+    env_vars:
+      CUDA_VISIBLE_DEVICES: "0"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.9.3"
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        dashboard-port: "8265"
+        num-gpus: "1"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              # GPU-enabled image with sentence-transformers
+              image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+              env:
+                - name: RAY_memory_usage_threshold
+                  value: "0.95"
+              volumeMounts:
+                - name: wiki-output
+                  mountPath: /output
+          volumes:
+            - name: wiki-output
+              persistentVolumeClaim:
+                claimName: wiki-output
+    workerGroupSpecs:
+      - groupName: gpu-workers
+        # Number of GPU workers (adjust based on available GPUs)
+        replicas: 2
+        minReplicas: 1
+        maxReplicas: 3
+        rayStartParams:
+          num-gpus: "1"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+

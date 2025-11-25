@@ -1,0 +1,13 @@
+# GPU requirements for embedding generation
+# Base requirements
+ray[default]==2.9.3
+tiktoken
+requests
+
+# GPU/ML requirements
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+
+# torch is included in the pytorch base image, but specify for local dev
+# torch>=2.1.0
+

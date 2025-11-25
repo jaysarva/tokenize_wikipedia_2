@@ -135,7 +135,13 @@ def fetch_and_tokenize(
             Path(tokens_dir).mkdir(parents=True, exist_ok=True)
             tokens_path = Path(tokens_dir) / _slug_filename(title)
             tmp_tokens = tokens_path.with_suffix(".tmp")
-            tmp_tokens.write_text(json.dumps({"title": title, "tokens": token_ids}, ensure_ascii=False))
+            # Save title, text, and tokens for downstream embedding generation
+            tmp_tokens.write_text(json.dumps({
+                "title": title,
+                "text": text,
+                "tokens": token_ids,
+                "token_count": len(token_ids),
+            }, ensure_ascii=False))
             tmp_tokens.replace(tokens_path)
         row = {
             "title": title,
