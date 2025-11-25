@@ -215,10 +215,11 @@ def process_titles(
     tokens_dir: Optional[str],
     checkpoint_path: Optional[str] = None,
     show_progress: bool = True,
+    already_completed: Optional[Set[str]] = None,
 ) -> List[Dict[str, object]]:
     inflight: List[ray.ObjectRef] = []
     results: List[Dict[str, object]] = []
-    completed_titles: List[str] = []
+    completed_titles: List[str] = list(already_completed) if already_completed else []
     total = len(titles)
     completed = 0
     ok_count = 0
@@ -340,6 +341,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.tokens_dir,
         checkpoint_path=args.checkpoint,
         show_progress=True,
+        already_completed=already_completed,
     )
     stats = summarize(rows)
     write_jsonl(args.output, rows)
@@ -353,8 +355,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if stats["errors"]:
         print(f"{stats['errors']} pages failed; check output for details.")
 
-    # Only fail if NO pages succeeded (all failed or no pages processed)
-    if stats["ok"] == 0 and stats["skipped"] == 0:
+    # Only fail if NO pages succeeded (including checkpoint pages from previous runs)
+    total_successful = stats["ok"] + stats["skipped"] + len(already_completed)
+    if total_successful == 0:
         print("FATAL: No pages were successfully tokenized!")
         return 1
     return 0
