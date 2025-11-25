@@ -1,7 +1,7 @@
 # GPU-enabled Dockerfile for Wikipedia tokenization and embedding generation
 # Uses PyTorch with CUDA support for GPU-accelerated sentence embeddings
 
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -22,7 +22,7 @@ COPY requirements-gpu.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-gpu.txt
 
-# Pre-download the MiniLM model to bake it into the image (optional but faster startup)
+# Pre-download the MiniLM model to bake it into the image (faster startup)
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Copy application code
