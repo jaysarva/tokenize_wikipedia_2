@@ -16,11 +16,10 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 import numpy as np
 import ray
@@ -51,21 +50,21 @@ def generate_embedding(
 ) -> Dict:
     """
     Generate embedding for a single article using GPU.
-    
+
     Args:
         title: Wikipedia article title
         text: Article text content
         model_name: Sentence-transformers model name
         output_dir: Directory to save embeddings
-    
+
     Returns:
         Dict with title, status, embedding_dim, etc.
     """
     from sentence_transformers import SentenceTransformer
-    
+
     start = time.perf_counter()
     output_path = Path(output_dir) / f"{_slug_filename(title)}.npy"
-    
+
     # Skip if already processed (idempotent)
     if output_path.exists():
         return {
@@ -74,9 +73,9 @@ def generate_embedding(
             "reason": "output_exists",
             "embedding_file": str(output_path),
         }
-    
+
     try:
-        # Load model (cached after first load on this worker)
+        # Load model on GPU (cached after first load on this worker)
         model = SentenceTransformer(model_name, device="cuda")
         
         # Generate embedding
@@ -116,18 +115,18 @@ def generate_embeddings_batch(
     """
     Generate embeddings for a batch of articles using GPU.
     More efficient than individual calls due to model loading overhead.
-    
+
     Args:
         articles: List of dicts with 'title' and 'text' keys
         model_name: Sentence-transformers model name
         output_dir: Directory to save embeddings
-    
+
     Returns:
         List of result dicts
     """
     from sentence_transformers import SentenceTransformer
-    
-    # Load model once for the batch
+
+    # Load model once for the batch on GPU
     model = SentenceTransformer(model_name, device="cuda")
     
     results = []
@@ -181,23 +180,70 @@ def load_articles_from_tokens(tokens_dir: Path) -> List[Dict]:
     {
         "title": "...",
         "text": "...",
-        "token_ids": [...],
-        ...
+        "tokens": [...],
+        "token_count": N
     }
+    
+    Articles are skipped if:
+    - JSON is malformed
+    - Required fields (title, text, token_count) are missing
+    - text is empty or whitespace-only
+    - token_count is 0 or missing
     """
     articles = []
+    skipped_empty = 0
+    skipped_no_tokens = 0
+    skipped_missing_fields = 0
+    skipped_malformed = 0
+    
     for token_file in tokens_dir.glob("*.json"):
         try:
             with open(token_file) as f:
                 data = json.load(f)
-            if "title" in data and "text" in data:
-                articles.append({
-                    "title": data["title"],
-                    "text": data["text"],
-                    "source_file": str(token_file),
-                })
+            
+            # Check required fields
+            if "title" not in data or "text" not in data:
+                log.warning(f"Skipping {token_file.name}: missing 'title' or 'text' field")
+                skipped_missing_fields += 1
+                continue
+            
+            title = data["title"]
+            text = data["text"]
+            token_count = data.get("token_count", 0)
+            
+            # Validate text is non-empty
+            if not text or not text.strip():
+                log.warning(f"Skipping '{title}': empty text")
+                skipped_empty += 1
+                continue
+            
+            # Validate tokenization produced tokens
+            if token_count == 0:
+                log.warning(f"Skipping '{title}': token_count is 0")
+                skipped_no_tokens += 1
+                continue
+            
+            articles.append({
+                "title": title,
+                "text": text,
+                "token_count": token_count,
+                "source_file": str(token_file),
+            })
+            
+        except json.JSONDecodeError as e:
+            log.warning(f"Skipping {token_file.name}: malformed JSON - {e}")
+            skipped_malformed += 1
         except Exception as e:
             log.warning(f"Failed to load {token_file}: {e}")
+            skipped_malformed += 1
+    
+    # Log summary
+    total_skipped = skipped_empty + skipped_no_tokens + skipped_missing_fields + skipped_malformed
+    if total_skipped > 0:
+        log.info(f"Skipped {total_skipped} files: "
+                 f"empty_text={skipped_empty}, no_tokens={skipped_no_tokens}, "
+                 f"missing_fields={skipped_missing_fields}, malformed={skipped_malformed}")
+    
     return articles
 
 
@@ -256,9 +302,8 @@ def main():
     # Filter already completed from checkpoint
     if checkpoint_path:
         completed = load_checkpoint(checkpoint_path)
-        original_count = len(articles)
         articles = [a for a in articles if a["title"] not in completed]
-        log.info(f"Checkpoint: {len(completed)} already done, {len(articles)} remaining")
+        log.info(f"Checkpoint: {len(completed)} done, {len(articles)} remaining")
     
     # Initialize Ray
     log.info("Initializing Ray...")
@@ -275,7 +320,15 @@ def main():
     
     log.info(f"Processing {len(articles)} articles in {len(batches)} batches")
     
-    # Submit batch tasks with concurrency limit
+    # Verify GPU is available
+    import torch
+    if not torch.cuda.is_available():
+        log.error("CUDA is not available! This job requires GPU.")
+        log.error("Ensure NVIDIA drivers and nvidia-container-toolkit are installed.")
+        sys.exit(1)
+    log.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+
+    # Submit batch tasks with concurrency limit (GPU enforced via @ray.remote)
     results = []
     completed_titles = list(completed) if checkpoint_path else []
     pending_refs = []

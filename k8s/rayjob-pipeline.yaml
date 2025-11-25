@@ -1,0 +1,152 @@
+# Combined RayJob: Tokenization → Embedding Pipeline
+# Runs both stages in sequence within a single job
+#
+# Prerequisites:
+#   - NVIDIA device plugin installed (for embedding stage)
+#   - GPU nodes configured with nvidia-container-toolkit
+#   - NFS PVC for shared storage across stages
+#
+# Usage:
+#   kubectl apply -n wiki-tokenizer -f k8s/rayjob-pipeline.yaml
+#
+# Monitor:
+#   kubectl get rayjob wiki-pipeline -n wiki-tokenizer -w
+#   kubectl logs -n wiki-tokenizer -l ray.io/node-type=head -f
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: wiki-pipeline
+  namespace: wiki-tokenizer
+spec:
+  entrypoint: >
+    python -m ray_app.pipeline
+    --pages-file /data/sample_pages.txt
+    --output-dir /output
+    --model all-MiniLM-L6-v2
+    --tokenize-concurrency 4
+    --embed-batch-size 10
+    --embed-concurrency 2
+  runtimeEnvYAML: |
+    env_vars:
+      WIKI_API_ENDPOINT: "https://en.wikipedia.org/w/api.php"
+      WIKI_USER_AGENT: "tokenize-wikipedia/0.1 (contact: sarva.jay.s@gmail.com)"
+      CUDA_VISIBLE_DEVICES: "0"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.9.3"
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        dashboard-port: "8265"
+        num-gpus: "1"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              # GPU image with sentence-transformers for embedding stage
+              image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+              env:
+                - name: RAY_memory_usage_threshold
+                  value: "0.95"
+              volumeMounts:
+                - name: wiki-pages
+                  mountPath: /data
+                - name: wiki-output
+                  mountPath: /output
+          volumes:
+            - name: wiki-pages
+              configMap:
+                name: wiki-page-list
+                optional: true
+            - name: wiki-output
+              persistentVolumeClaim:
+                claimName: wiki-output
+    workerGroupSpecs:
+      # CPU workers for tokenization stage
+      - groupName: cpu-workers
+        replicas: 2
+        minReplicas: 1
+        maxReplicas: 4
+        rayStartParams:
+          num-gpus: "0"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: "2Gi"
+                  limits:
+                    cpu: "2"
+                    memory: "4Gi"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-pages
+                    mountPath: /data
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-pages
+                configMap:
+                  name: wiki-page-list
+                  optional: true
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+      # GPU workers for embedding stage
+      - groupName: gpu-workers
+        replicas: 1
+        minReplicas: 0
+        maxReplicas: 2
+        rayStartParams:
+          num-gpus: "1"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-pages
+                    mountPath: /data
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-pages
+                configMap:
+                  name: wiki-page-list
+                  optional: true
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+
