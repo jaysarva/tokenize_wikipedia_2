@@ -1,0 +1,20 @@
+OpenAI
+Ray (distributed computing)
+Kubernetes
+Python (programming language)
+Machine learning
+Natural language processing
+Large language model
+Transformer (machine learning model)
+Tokenization
+Distributed computing
+Parallel computing
+Computer science
+Cloud computing
+Distributed database
+MapReduce
+Apache Hadoop
+Apache Spark
+Eventual consistency
+Database transaction
+Consensus (computer science)

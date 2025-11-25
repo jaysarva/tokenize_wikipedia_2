@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wiki-page-list
+  namespace: wiki-tokenizer
+data:
+  sample_pages.txt: |
+    OpenAI
+    Ray (distributed computing)
+    Kubernetes
+    Python (programming language)
+    Machine learning
+    Natural language processing
+    Large language model
+    Transformer (machine learning model)
+    Tokenization
+    Distributed computing
+    Parallel computing
+    Computer science
+    Cloud computing
+    Distributed database
+    MapReduce
+    Apache Hadoop
+    Apache Spark
+    Eventual consistency
+    Database transaction
+    Consensus (computer science)

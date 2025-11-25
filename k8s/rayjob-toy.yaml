@@ -1,0 +1,82 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: wiki-rayjob-sample
+  namespace: wiki-tokenizer
+spec:
+  entrypoint: >
+    python -m ray_app.tokenize_wiki
+    --pages-file /data/sample_pages.txt
+    --output /tmp/token_counts.jsonl
+    --tokens-dir /tmp/tokens
+    --concurrency 1
+  runtimeEnvYAML: |
+    env_vars:
+      WIKI_API_ENDPOINT: "https://en.wikipedia.org/w/api.php"
+      WIKI_USER_AGENT: "tokenize-wikipedia/0.1 (contact: sarva.jay.s@gmail.com)"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.9.3"
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        dashboard-port: "8265"
+        dashboard-agent-listen-port: "52365"
+        object-store-memory: "268435456"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: "tokenize-wiki:local"
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+                limits:
+                  cpu: "2"
+                  memory: "2.5Gi"
+              env:
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+              volumeMounts:
+                - name: wiki-pages
+                  mountPath: /data
+          volumes:
+            - name: wiki-pages
+              configMap:
+                name: wiki-page-list
+                optional: true
+    workerGroupSpecs:
+      - groupName: toy-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 2
+        rayStartParams:
+          object-store-memory: "268435456"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "tokenize-wiki:local"
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: "2Gi"
+                  limits:
+                    cpu: "2"
+                    memory: "2.5Gi"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.99"
+                volumeMounts:
+                  - name: wiki-pages
+                    mountPath: /data
+            volumes:
+              - name: wiki-pages
+                configMap:
+                  name: wiki-page-list
+                  optional: true
