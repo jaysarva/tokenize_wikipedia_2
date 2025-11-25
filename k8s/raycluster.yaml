@@ -21,7 +21,7 @@ spec:
         containers:
           - name: ray-head
             # Update DOCKERHUB_USERNAME to your Docker Hub username
-            image: "docker.io/DOCKERHUB_USERNAME/tokenize-wiki:v1"
+            image: "docker.io/jaysarva027/tokenize-wiki:v1"
             imagePullPolicy: Always
             resources:
               requests:
@@ -54,7 +54,7 @@ spec:
           containers:
             - name: ray-worker
               # Update DOCKERHUB_USERNAME to your Docker Hub username
-              image: "docker.io/DOCKERHUB_USERNAME/tokenize-wiki:v1"
+              image: "docker.io/jaysarva027/tokenize-wiki:v1"
               imagePullPolicy: Always
               resources:
                 requests:
