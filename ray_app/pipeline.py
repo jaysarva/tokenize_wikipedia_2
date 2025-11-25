@@ -3,21 +3,26 @@
 End-to-end Wikipedia pipeline: Tokenization → Embedding
 
 This script runs both stages in sequence within a single Ray job:
-1. Tokenize Wikipedia articles (CPU-bound, uses Wikipedia API)
+1. Tokenize Wikipedia articles (CPU-bound, from API or CirrusSearch dumps)
 2. Generate embeddings for tokenized articles (GPU-accelerated)
 
-Usage:
+Usage (Live API mode):
     python -m ray_app.pipeline \
         --pages-file /data/sample_pages.txt \
         --output-dir /output \
         --model all-MiniLM-L6-v2 \
         --concurrency 4
+
+Usage (CirrusSearch mode):
+    python -m ray_app.pipeline \
+        --cirrus-dir /dumps \
+        --output-dir /output \
+        --model all-MiniLM-L6-v2 \
+        --tokenize-concurrency 8
 """
 
 import argparse
-import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -45,10 +50,23 @@ def run_tokenization(args) -> bool:
         "--concurrency", str(args.tokenize_concurrency),
     ]
 
-    if args.pages_file:
+    # CirrusSearch mode (preferred for bulk processing)
+    if args.cirrus_dir:
+        tokenize_args.extend(["--cirrus-dir", args.cirrus_dir])
+        log.info(f"Mode: CirrusSearch (reading from {args.cirrus_dir})")
+    elif args.cirrus_file:
+        tokenize_args.extend(["--cirrus-file", args.cirrus_file])
+        log.info(f"Mode: CirrusSearch (reading from {args.cirrus_file})")
+    # Live API mode
+    elif args.pages_file:
         tokenize_args.extend(["--pages-file", args.pages_file])
-    if args.pages:
+        log.info(f"Mode: Live API (reading titles from {args.pages_file})")
+    elif args.pages:
         tokenize_args.extend(["--pages", args.pages])
+        log.info(f"Mode: Live API (processing {len(args.pages.split(','))} pages)")
+    else:
+        log.info("Mode: Live API (using default sample pages)")
+
     if args.max_pages:
         tokenize_args.extend(["--max-pages", str(args.max_pages)])
 
@@ -127,13 +145,45 @@ def run_embedding(args) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="End-to-end Wikipedia tokenization and embedding pipeline"
+        description="End-to-end Wikipedia tokenization and embedding pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # CirrusSearch mode (recommended for bulk processing)
+  python -m ray_app.pipeline --cirrus-dir /dumps --output-dir /output
+
+  # Live API mode (for small page lists)
+  python -m ray_app.pipeline --pages-file /data/pages.txt --output-dir /output
+
+  # Skip tokenization (use existing tokens)
+  python -m ray_app.pipeline --skip-tokenize --output-dir /output
+        """,
     )
     
-    # Input options
-    parser.add_argument("--pages", help="Comma-separated page titles")
-    parser.add_argument("--pages-file", help="Path to file with newline-delimited titles")
-    parser.add_argument("--max-pages", type=int, help="Limit number of pages processed")
+    # Input options - CirrusSearch mode
+    input_group = parser.add_argument_group("Input source")
+    input_group.add_argument(
+        "--cirrus-dir",
+        help="Directory with CirrusSearch dump files (enables CirrusSearch mode)"
+    )
+    input_group.add_argument(
+        "--cirrus-file",
+        help="Single CirrusSearch dump file (enables CirrusSearch mode)"
+    )
+    # Input options - Live API mode
+    input_group.add_argument(
+        "--pages",
+        help="Comma-separated page titles (Live API mode)"
+    )
+    input_group.add_argument(
+        "--pages-file",
+        help="Path to file with newline-delimited titles (Live API mode)"
+    )
+    input_group.add_argument(
+        "--max-pages",
+        type=int,
+        help="Limit number of pages processed"
+    )
     
     # Output options
     parser.add_argument(
@@ -187,11 +237,18 @@ def main():
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Determine mode for logging
+    if args.cirrus_dir or args.cirrus_file:
+        mode = "CirrusSearch Dump"
+    else:
+        mode = "Live Wikipedia API"
+    
     log.info("=" * 60)
     log.info("WIKIPEDIA TOKENIZATION + EMBEDDING PIPELINE")
     log.info("=" * 60)
+    log.info(f"Mode: {mode}")
     log.info(f"Output directory: {args.output_dir}")
-    log.info(f"Model: {args.model}")
+    log.info(f"Embedding model: {args.model}")
     
     start_time = time.perf_counter()
     
@@ -226,4 +283,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -5,6 +5,11 @@ GPU-accelerated embedding generation for Wikipedia articles using sentence-trans
 This script reads tokenized Wikipedia articles and generates embeddings using
 the MiniLM model on NVIDIA GPUs via Ray distributed computing.
 
+Designed for scale:
+- Streaming file iteration (doesn't load all articles into memory)
+- Streaming index writes (doesn't accumulate all results)
+- Works with CPU-only head nodes (GPU check happens on workers)
+
 Usage:
     python -m ray_app.embed_wiki \
         --input-dir /output/tokens \
@@ -19,7 +24,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, Iterator, List, Optional, Set
 
 import numpy as np
 import ray
@@ -39,71 +44,6 @@ def _slug_filename(title: str) -> str:
     safe = safe[:50]
     h = hashlib.md5(title.encode()).hexdigest()[:8]
     return f"{safe}_{h}"
-
-
-@ray.remote(num_gpus=1, max_retries=2, retry_exceptions=True)
-def generate_embedding(
-    title: str,
-    text: str,
-    model_name: str,
-    output_dir: str,
-) -> Dict:
-    """
-    Generate embedding for a single article using GPU.
-
-    Args:
-        title: Wikipedia article title
-        text: Article text content
-        model_name: Sentence-transformers model name
-        output_dir: Directory to save embeddings
-
-    Returns:
-        Dict with title, status, embedding_dim, etc.
-    """
-    from sentence_transformers import SentenceTransformer
-
-    start = time.perf_counter()
-    output_path = Path(output_dir) / f"{_slug_filename(title)}.npy"
-
-    # Skip if already processed (idempotent)
-    if output_path.exists():
-        return {
-            "title": title,
-            "status": "skipped",
-            "reason": "output_exists",
-            "embedding_file": str(output_path),
-        }
-
-    try:
-        # Load model on GPU (cached after first load on this worker)
-        model = SentenceTransformer(model_name, device="cuda")
-        
-        # Generate embedding
-        embedding = model.encode(text, convert_to_numpy=True, show_progress_bar=False)
-        
-        # Save as numpy array
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(output_path, embedding)
-        
-        duration = time.perf_counter() - start
-        
-        return {
-            "title": title,
-            "status": "ok",
-            "embedding_dim": len(embedding),
-            "embedding_file": str(output_path),
-            "duration_sec": round(duration, 3),
-        }
-        
-    except Exception as exc:
-        duration = time.perf_counter() - start
-        log.error(f"Error embedding '{title}': {exc}")
-        return {
-            "title": title,
-            "status": "error",
-            "error": str(exc),
-            "duration_sec": round(duration, 3),
-        }
 
 
 @ray.remote(num_gpus=1, max_retries=2, retry_exceptions=True)
@@ -172,9 +112,15 @@ def generate_embeddings_batch(
     return results
 
 
-def load_articles_from_tokens(tokens_dir: Path) -> List[Dict]:
+def stream_articles_from_tokens(
+    tokens_dir: Path,
+    completed: Optional[Set[str]] = None,
+) -> Iterator[Dict]:
     """
-    Load article texts from token JSON files.
+    Stream article texts from token JSON files (memory-efficient).
+    
+    Yields articles one at a time instead of loading all into memory.
+    This is critical for processing millions of articles.
     
     Each token file should have format:
     {
@@ -183,18 +129,14 @@ def load_articles_from_tokens(tokens_dir: Path) -> List[Dict]:
         "tokens": [...],
         "token_count": N
     }
-    
-    Articles are skipped if:
-    - JSON is malformed
-    - Required fields (title, text, token_count) are missing
-    - text is empty or whitespace-only
-    - token_count is 0 or missing
     """
-    articles = []
+    completed = completed or set()
     skipped_empty = 0
     skipped_no_tokens = 0
     skipped_missing_fields = 0
     skipped_malformed = 0
+    skipped_checkpoint = 0
+    yielded = 0
     
     for token_file in tokens_dir.glob("*.json"):
         try:
@@ -203,7 +145,6 @@ def load_articles_from_tokens(tokens_dir: Path) -> List[Dict]:
             
             # Check required fields
             if "title" not in data or "text" not in data:
-                log.warning(f"Skipping {token_file.name}: missing 'title' or 'text' field")
                 skipped_missing_fields += 1
                 continue
             
@@ -211,63 +152,74 @@ def load_articles_from_tokens(tokens_dir: Path) -> List[Dict]:
             text = data["text"]
             token_count = data.get("token_count", 0)
             
+            # Skip if already completed (from checkpoint)
+            if title in completed:
+                skipped_checkpoint += 1
+                continue
+            
             # Validate text is non-empty
             if not text or not text.strip():
-                log.warning(f"Skipping '{title}': empty text")
                 skipped_empty += 1
                 continue
             
             # Validate tokenization produced tokens
             if token_count == 0:
-                log.warning(f"Skipping '{title}': token_count is 0")
                 skipped_no_tokens += 1
                 continue
             
-            articles.append({
+            yielded += 1
+            yield {
                 "title": title,
                 "text": text,
                 "token_count": token_count,
                 "source_file": str(token_file),
-            })
+            }
             
-        except json.JSONDecodeError as e:
-            log.warning(f"Skipping {token_file.name}: malformed JSON - {e}")
+        except json.JSONDecodeError:
             skipped_malformed += 1
-        except Exception as e:
-            log.warning(f"Failed to load {token_file}: {e}")
+        except Exception:
             skipped_malformed += 1
     
-    # Log summary
-    total_skipped = skipped_empty + skipped_no_tokens + skipped_missing_fields + skipped_malformed
-    if total_skipped > 0:
-        log.info(f"Skipped {total_skipped} files: "
-                 f"empty_text={skipped_empty}, no_tokens={skipped_no_tokens}, "
-                 f"missing_fields={skipped_missing_fields}, malformed={skipped_malformed}")
-    
-    return articles
+    # Log summary at end
+    total_skipped = (skipped_empty + skipped_no_tokens + 
+                     skipped_missing_fields + skipped_malformed)
+    if total_skipped > 0 or skipped_checkpoint > 0:
+        log.info(f"Streaming complete: yielded={yielded}, "
+                 f"from_checkpoint={skipped_checkpoint}, "
+                 f"skipped={total_skipped} (empty={skipped_empty}, "
+                 f"no_tokens={skipped_no_tokens}, malformed={skipped_malformed})")
 
 
-def load_checkpoint(checkpoint_path: Path) -> Set[str]:
+def count_token_files(tokens_dir: Path) -> int:
+    """Count token files without loading them (for progress estimation)."""
+    return sum(1 for _ in tokens_dir.glob("*.json"))
+
+
+def load_checkpoint(checkpoint_path: Optional[Path]) -> Set[str]:
     """Load set of already-processed titles from checkpoint."""
-    if not checkpoint_path.exists():
+    if not checkpoint_path or not checkpoint_path.exists():
         return set()
     try:
         with open(checkpoint_path) as f:
             data = json.load(f)
-        return set(data.get("completed", []))
+        completed = set(data.get("completed", []))
+        log.info(f"Loaded checkpoint with {len(completed)} completed titles")
+        return completed
     except Exception:
         return set()
 
 
-def save_checkpoint(checkpoint_path: Path, completed_titles: List[str]):
+def save_checkpoint(checkpoint_path: Optional[Path], completed_titles: List[str]):
     """Save checkpoint with completed titles."""
+    if not checkpoint_path:
+        return
     data = {
         "completed": completed_titles,
         "count": len(completed_titles),
         "timestamp": time.time(),
     }
     tmp = checkpoint_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp.write_text(json.dumps(data))
     tmp.replace(checkpoint_path)
 
 
@@ -280,6 +232,7 @@ def main():
     parser.add_argument("--model", default="all-MiniLM-L6-v2", help="Sentence-transformers model name")
     parser.add_argument("--batch-size", type=int, default=10, help="Articles per batch task")
     parser.add_argument("--concurrency", type=int, default=2, help="Max concurrent GPU tasks")
+    parser.add_argument("--max-articles", type=int, help="Limit number of articles to process")
     args = parser.parse_args()
     
     input_dir = Path(args.input_dir)
@@ -290,94 +243,167 @@ def main():
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load articles
-    log.info(f"Loading articles from {input_dir}")
-    articles = load_articles_from_tokens(input_dir)
-    log.info(f"Found {len(articles)} articles with text")
+    # Count files for progress estimation (fast, doesn't load content)
+    total_files = count_token_files(input_dir)
+    log.info(f"Found {total_files} token files in {input_dir}")
     
-    if not articles:
-        log.error("No articles found! Check --input-dir path.")
+    if total_files == 0:
+        log.error("No token files found! Check --input-dir path.")
         sys.exit(1)
     
-    # Filter already completed from checkpoint
-    if checkpoint_path:
-        completed = load_checkpoint(checkpoint_path)
-        articles = [a for a in articles if a["title"] not in completed]
-        log.info(f"Checkpoint: {len(completed)} done, {len(articles)} remaining")
+    # Load checkpoint
+    completed = load_checkpoint(checkpoint_path)
+    completed_titles = list(completed)
     
-    # Initialize Ray
+    # Initialize Ray (connect to existing cluster)
     log.info("Initializing Ray...")
     ray.init(address="auto", ignore_reinit_error=True)
+    
+    # Log cluster resources (don't fail if no GPU on head - workers may have GPUs)
+    cluster_resources = ray.cluster_resources()
+    log.info(f"Cluster resources: {cluster_resources}")
+    
+    num_gpus = cluster_resources.get("GPU", 0)
+    if num_gpus == 0:
+        log.warning("No GPUs detected in Ray cluster! Embedding tasks will queue until GPU workers join.")
+        log.warning("If this persists, check that GPU workers are configured correctly.")
+    else:
+        log.info(f"Cluster has {num_gpus} GPU(s) available")
     
     log.info(f"Model: {args.model}")
     log.info(f"Output: {output_dir}")
     log.info(f"Batch size: {args.batch_size}, Concurrency: {args.concurrency}")
     
-    # Create batches
-    batches = []
-    for i in range(0, len(articles), args.batch_size):
-        batches.append(articles[i:i + args.batch_size])
+    # Streaming processing with batching
+    pending_refs: List[ray.ObjectRef] = []
+    current_batch: List[Dict] = []
     
-    log.info(f"Processing {len(articles)} articles in {len(batches)} batches")
-    
-    # Verify GPU is available
-    import torch
-    if not torch.cuda.is_available():
-        log.error("CUDA is not available! This job requires GPU.")
-        log.error("Ensure NVIDIA drivers and nvidia-container-toolkit are installed.")
-        sys.exit(1)
-    log.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
-
-    # Submit batch tasks with concurrency limit (GPU enforced via @ray.remote)
-    results = []
-    completed_titles = list(completed) if checkpoint_path else []
-    pending_refs = []
-    batch_idx = 0
+    submitted = 0
     ok_count = 0
     skip_count = 0
     err_count = 0
+    checkpoint_interval = 100
     
     start_time = time.perf_counter()
     
-    while batch_idx < len(batches) or pending_refs:
-        # Submit new tasks up to concurrency limit
-        while len(pending_refs) < args.concurrency and batch_idx < len(batches):
-            batch = batches[batch_idx]
-            ref = generate_embeddings_batch.remote(batch, args.model, str(output_dir))
-            pending_refs.append(ref)
-            batch_idx += 1
+    # Open index file for streaming writes (append mode for resume)
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    def process_completed_tasks():
+        """Process any completed tasks and update counters."""
+        nonlocal ok_count, skip_count, err_count
         
         if not pending_refs:
-            break
+            return
         
-        # Wait for at least one task to complete
-        done_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=300)
+        # Check for completed tasks (non-blocking with timeout=0)
+        done_refs, remaining = ray.wait(pending_refs, num_returns=len(pending_refs), timeout=0)
+        pending_refs[:] = remaining
         
         for ref in done_refs:
             try:
                 batch_results = ray.get(ref)
-                for r in batch_results:
-                    results.append(r)
-                    if r["status"] == "ok":
-                        ok_count += 1
-                        completed_titles.append(r["title"])
-                    elif r["status"] == "skipped":
-                        skip_count += 1
-                        completed_titles.append(r["title"])
-                    else:
-                        err_count += 1
+                # Stream results to index file
+                with open(index_file, "a") as f:
+                    for r in batch_results:
+                        f.write(json.dumps(r) + "\n")
+                        if r["status"] == "ok":
+                            ok_count += 1
+                            completed_titles.append(r["title"])
+                        elif r["status"] == "skipped":
+                            skip_count += 1
+                            completed_titles.append(r["title"])
+                        else:
+                            err_count += 1
                 
                 # Progress log
                 total_done = ok_count + skip_count + err_count
-                log.info(f"[{total_done}/{len(articles)}] ok={ok_count} skip={skip_count} err={err_count}")
+                log.info(f"[{total_done}/{submitted}] ok={ok_count} skip={skip_count} err={err_count}")
                 
                 # Save checkpoint periodically
-                if checkpoint_path and total_done % 50 == 0:
+                if checkpoint_path and total_done % checkpoint_interval == 0:
                     save_checkpoint(checkpoint_path, completed_titles)
                     
             except Exception as e:
                 log.error(f"Batch task failed: {e}")
-                err_count += args.batch_size  # Assume whole batch failed
+                err_count += args.batch_size
+    
+    # Stream articles and submit batches
+    article_stream = stream_articles_from_tokens(input_dir, completed)
+    
+    for article in article_stream:
+        current_batch.append(article)
+        
+        # Submit batch when full
+        if len(current_batch) >= args.batch_size:
+            # Wait if at concurrency limit
+            while len(pending_refs) >= args.concurrency:
+                done_refs, pending_refs[:] = ray.wait(pending_refs, num_returns=1, timeout=60)
+                for ref in done_refs:
+                    try:
+                        batch_results = ray.get(ref)
+                        with open(index_file, "a") as f:
+                            for r in batch_results:
+                                f.write(json.dumps(r) + "\n")
+                                if r["status"] == "ok":
+                                    ok_count += 1
+                                    completed_titles.append(r["title"])
+                                elif r["status"] == "skipped":
+                                    skip_count += 1
+                                    completed_titles.append(r["title"])
+                                else:
+                                    err_count += 1
+                        total_done = ok_count + skip_count + err_count
+                        log.info(f"[{total_done}/{submitted}] ok={ok_count} skip={skip_count} err={err_count}")
+                        if checkpoint_path and total_done % checkpoint_interval == 0:
+                            save_checkpoint(checkpoint_path, completed_titles)
+                    except Exception as e:
+                        log.error(f"Batch task failed: {e}")
+                        err_count += args.batch_size
+            
+            # Submit the batch
+            ref = generate_embeddings_batch.remote(current_batch, args.model, str(output_dir))
+            pending_refs.append(ref)
+            submitted += len(current_batch)
+            current_batch = []
+        
+        # Check max articles limit
+        if args.max_articles and submitted >= args.max_articles:
+            log.info(f"Reached max_articles limit ({args.max_articles})")
+            break
+    
+    # Submit final partial batch
+    if current_batch:
+        ref = generate_embeddings_batch.remote(current_batch, args.model, str(output_dir))
+        pending_refs.append(ref)
+        submitted += len(current_batch)
+    
+    log.info(f"Submitted {submitted} articles, waiting for {len(pending_refs)} pending batches...")
+    
+    # Drain remaining tasks
+    while pending_refs:
+        done_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=300)
+        for ref in done_refs:
+            try:
+                batch_results = ray.get(ref)
+                with open(index_file, "a") as f:
+                    for r in batch_results:
+                        f.write(json.dumps(r) + "\n")
+                        if r["status"] == "ok":
+                            ok_count += 1
+                            completed_titles.append(r["title"])
+                        elif r["status"] == "skipped":
+                            skip_count += 1
+                            completed_titles.append(r["title"])
+                        else:
+                            err_count += 1
+                total_done = ok_count + skip_count + err_count
+                log.info(f"[{total_done}/{submitted}] ok={ok_count} skip={skip_count} err={err_count}")
+                if checkpoint_path and total_done % checkpoint_interval == 0:
+                    save_checkpoint(checkpoint_path, completed_titles)
+            except Exception as e:
+                log.error(f"Batch task failed: {e}")
+                err_count += args.batch_size
     
     elapsed = time.perf_counter() - start_time
     
@@ -385,22 +411,18 @@ def main():
     if checkpoint_path:
         save_checkpoint(checkpoint_path, completed_titles)
     
-    # Write index file
-    log.info(f"Writing index to {index_file}")
-    with open(index_file, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-    
     # Summary
+    total_processed = ok_count + skip_count + err_count
     log.info("")
     log.info("=" * 50)
     log.info("EMBEDDING GENERATION COMPLETE")
     log.info("=" * 50)
-    log.info(f"Total articles: {len(articles)}")
+    log.info(f"Total processed: {total_processed}")
     log.info(f"  OK:      {ok_count}")
     log.info(f"  Skipped: {skip_count}")
     log.info(f"  Errors:  {err_count}")
-    log.info(f"Time: {elapsed:.1f}s ({len(articles)/elapsed:.2f} articles/sec)")
+    if total_processed > 0:
+        log.info(f"Time: {elapsed:.1f}s ({total_processed/elapsed:.2f} articles/sec)")
     log.info(f"Output: {output_dir}")
     log.info(f"Index:  {index_file}")
     log.info("=" * 50)
@@ -408,4 +430,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

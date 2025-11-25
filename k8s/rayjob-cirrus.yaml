@@ -53,22 +53,84 @@ spec:
             - name: download-dumps
               image: alpine:3.19
               command: ["/bin/sh", "-c"]
+              env:
+                # Change this to use different wikis:
+                #   enwiki     = English Wikipedia (~40GB, 6M+ articles)
+                #   simplewiki = Simple English Wikipedia (~600MB, 200K articles)
+                #   enwikibooks = English Wikibooks (~2GB, 100K articles)
+                - name: WIKI_NAME
+                  value: "simplewiki"
               args:
                 - |
                   set -e
-                  apk add --no-cache curl
+                  apk add --no-cache curl gzip
+                  
+                  # Use WIKI_NAME env var (default to simplewiki for testing)
+                  WIKI="${WIKI_NAME:-simplewiki}"
+                  echo "Target wiki: $WIKI"
                   
                   DUMP_BASE_URL="https://dumps.wikimedia.org/other/cirrussearch"
+                  MARKER_SUFFIX=".complete"
                   
-                  # Check for existing dump files
-                  if ls /dumps/enwiki-*-cirrussearch-content.json.gz 1>/dev/null 2>&1; then
-                    echo "Dump file(s) already exist in /dumps, skipping download"
-                    ls -lh /dumps/*.json.gz
-                    exit 0
-                  fi
+                  # Function to verify gzip file integrity (full verification, ~3-7 min for 40GB)
+                  verify_gzip_full() {
+                    local file="$1"
+                    echo "Running full gzip integrity check (this may take a few minutes)..."
+                    if gzip -t "$file" 2>/dev/null; then
+                      echo "✓ Full integrity check passed"
+                      return 0
+                    else
+                      echo "✗ File is corrupted or incomplete"
+                      return 1
+                    fi
+                  }
                   
+                  # Function to quick-check file size against expected (seconds, not minutes)
+                  # Returns: 0=size matches, 1=size mismatch or can't determine
+                  quick_size_check() {
+                    local file="$1"
+                    local url="$2"
+                    
+                    local local_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+                    local remote_size=$(curl -sI -L "$url" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r')
+                    
+                    if [ -z "$local_size" ] || [ -z "$remote_size" ]; then
+                      echo "Could not determine sizes for comparison"
+                      return 1
+                    fi
+                    
+                    echo "Local size:  $local_size bytes"
+                    echo "Remote size: $remote_size bytes"
+                    
+                    if [ "$local_size" = "$remote_size" ]; then
+                      echo "✓ Size matches expected"
+                      return 0
+                    else
+                      echo "✗ Size mismatch (incomplete download)"
+                      return 1
+                    fi
+                  }
+                  
+                  # Check for existing dump files for this wiki
+                  for f in /dumps/${WIKI}-*-cirrussearch-content.json.gz; do
+                    if [ -f "$f" ]; then
+                      # Case 1: Has marker file - already verified, skip immediately
+                      if [ -f "${f}${MARKER_SUFFIX}" ]; then
+                        echo "Found verified dump file (has marker): $f"
+                        ls -lh "$f"
+                        exit 0
+                      fi
+                      
+                      # Case 2: No marker - need to verify
+                      echo "Found existing file without marker: $f"
+                      echo "Will verify after determining remote URL..."
+                      # Store for later verification
+                      EXISTING_FILE="$f"
+                    fi
+                  done
+                  
+                  # Get the remote URL (needed for size check and potential download)
                   echo "Finding latest dump date..."
-                  # Get the most recent date directory
                   LATEST_DATE=$(curl -sL "$DUMP_BASE_URL/" | grep -oE '20[0-9]{6}' | sort -r | head -1)
                   if [ -z "$LATEST_DATE" ]; then
                     echo "ERROR: Could not determine latest dump date"
@@ -77,23 +139,78 @@ spec:
                   echo "Latest dump date: $LATEST_DATE"
                   
                   INDEX_URL="$DUMP_BASE_URL/$LATEST_DATE/"
-                  
-                  # Get the dump filename
-                  DUMP_FILE=$(curl -sL "$INDEX_URL" | grep -oE 'enwiki-[0-9]+-cirrussearch-content\.json\.gz' | head -1)
+                  # Find the content dump file for our wiki
+                  DUMP_FILE=$(curl -sL "$INDEX_URL" | grep -oE "${WIKI}-[0-9]+-cirrussearch-content\.json\.gz" | head -1)
                   
                   if [ -z "$DUMP_FILE" ]; then
                     echo "ERROR: Could not find dump file in index"
                     exit 1
                   fi
+                  REMOTE_URL="$INDEX_URL$DUMP_FILE"
+                  echo "Remote file: $DUMP_FILE"
                   
-                  echo "Found dump file: $DUMP_FILE"
-                  echo "Downloading from $INDEX_URL$DUMP_FILE..."
+                  # Now verify existing file if we found one
+                  if [ -n "$EXISTING_FILE" ]; then
+                    echo ""
+                    echo "Verifying existing file: $EXISTING_FILE"
+                    
+                    # Quick size check first (takes seconds)
+                    if quick_size_check "$EXISTING_FILE" "$REMOTE_URL"; then
+                      # Size matches - do full gzip verification
+                      if verify_gzip_full "$EXISTING_FILE"; then
+                        echo "✓ File is valid! Creating marker for future runs..."
+                        touch "${EXISTING_FILE}${MARKER_SUFFIX}"
+                        ls -lh "$EXISTING_FILE"
+                        exit 0
+                      else
+                        echo "Size matched but content corrupted - will re-download"
+                        rm -f "$EXISTING_FILE"
+                      fi
+                    else
+                      echo "Size mismatch - will resume download"
+                      # Don't delete - curl -C - will resume
+                    fi
+                  fi
+                  
+                  # Proceed with download
+                  echo ""
+                  echo "Downloading from $REMOTE_URL..."
                   echo "This may take 30-60 minutes depending on network speed (~40GB)"
                   
-                  # Download with progress and resume support
-                  curl -L -C - -o "/dumps/$DUMP_FILE" "$INDEX_URL$DUMP_FILE"
+                  # Download with resume support (-C -) and retry on failure
+                  MAX_RETRIES=3
+                  RETRY=0
+                  while [ $RETRY -lt $MAX_RETRIES ]; do
+                    if curl -L -C - --retry 3 --retry-delay 5 -o "/dumps/$DUMP_FILE" "$REMOTE_URL"; then
+                      echo "Download completed, verifying integrity..."
+                      if verify_gzip_full "/dumps/$DUMP_FILE"; then
+                        # Create marker file to indicate successful download
+                        touch "/dumps/${DUMP_FILE}${MARKER_SUFFIX}"
+                        echo "Download complete and verified!"
+                        break
+                      else
+                        echo "File verification failed, removing corrupted file..."
+                        rm -f "/dumps/$DUMP_FILE"
+                        RETRY=$((RETRY + 1))
+                        if [ $RETRY -lt $MAX_RETRIES ]; then
+                          echo "Retrying download (attempt $((RETRY + 1))/$MAX_RETRIES)..."
+                          sleep 10
+                        fi
+                      fi
+                    else
+                      RETRY=$((RETRY + 1))
+                      if [ $RETRY -lt $MAX_RETRIES ]; then
+                        echo "Download failed, retrying (attempt $((RETRY + 1))/$MAX_RETRIES)..."
+                        sleep 10
+                      fi
+                    fi
+                  done
                   
-                  echo "Download complete!"
+                  if [ $RETRY -ge $MAX_RETRIES ]; then
+                    echo "ERROR: Failed to download after $MAX_RETRIES attempts"
+                    exit 1
+                  fi
+                  
                   ls -lh /dumps/
                   
                   # Fix permissions so Ray containers can read the file

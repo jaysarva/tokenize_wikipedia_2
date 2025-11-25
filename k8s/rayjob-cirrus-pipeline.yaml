@@ -1,0 +1,215 @@
+# Full CirrusSearch Pipeline: Download → Tokenize → Embed
+#
+# This job runs the complete pipeline:
+# 1. Init container downloads CirrusSearch dump (~40GB, skipped if exists)
+# 2. Tokenize all articles from the dump (CPU workers)
+# 3. Generate embeddings for all articles (GPU workers)
+#
+# Prerequisites:
+#   1. Create PVCs: kubectl apply -n wiki-tokenizer -f k8s/pvc-dumps.yaml -f k8s/pvc.yaml
+#   2. GPU nodes with nvidia-container-toolkit (for embedding stage)
+#
+# Usage:
+#   kubectl apply -n wiki-tokenizer -f k8s/rayjob-cirrus-pipeline.yaml
+#
+# Monitor:
+#   kubectl get rayjob wiki-cirrus-pipeline -n wiki-tokenizer -w
+#   kubectl logs -n wiki-tokenizer -l ray.io/node-type=head -f
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: wiki-cirrus-pipeline
+  namespace: wiki-tokenizer
+spec:
+  entrypoint: >
+    python -m ray_app.pipeline
+    --cirrus-dir /dumps
+    --output-dir /output
+    --model all-MiniLM-L6-v2
+    --tokenize-concurrency 8
+    --embed-batch-size 10
+    --embed-concurrency 2
+  runtimeEnvYAML: |
+    env_vars:
+      TIKTOKEN_ENCODING: "cl100k_base"
+      CUDA_VISIBLE_DEVICES: "0"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.9.3"
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        dashboard-port: "8265"
+        dashboard-agent-listen-port: "52365"
+        num-gpus: "1"
+        object-store-memory: "536870912"  # 512MB
+      template:
+        spec:
+          # Init container downloads CirrusSearch dump if not present
+          initContainers:
+            - name: download-dumps
+              image: alpine:3.19
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  apk add --no-cache curl
+                  
+                  DUMP_BASE_URL="https://dumps.wikimedia.org/other/cirrussearch"
+                  
+                  # Check for existing dump files
+                  if ls /dumps/enwiki-*-cirrussearch-content.json.gz 1>/dev/null 2>&1; then
+                    echo "Dump file(s) already exist in /dumps, skipping download"
+                    ls -lh /dumps/*.json.gz
+                    exit 0
+                  fi
+                  
+                  echo "Finding latest dump date..."
+                  LATEST_DATE=$(curl -sL "$DUMP_BASE_URL/" | grep -oE '20[0-9]{6}' | sort -r | head -1)
+                  if [ -z "$LATEST_DATE" ]; then
+                    echo "ERROR: Could not determine latest dump date"
+                    exit 1
+                  fi
+                  echo "Latest dump date: $LATEST_DATE"
+                  
+                  INDEX_URL="$DUMP_BASE_URL/$LATEST_DATE/"
+                  DUMP_FILE=$(curl -sL "$INDEX_URL" | grep -oE 'enwiki-[0-9]+-cirrussearch-content\.json\.gz' | head -1)
+                  
+                  if [ -z "$DUMP_FILE" ]; then
+                    echo "ERROR: Could not find dump file in index"
+                    exit 1
+                  fi
+                  
+                  echo "Found dump file: $DUMP_FILE"
+                  echo "Downloading from $INDEX_URL$DUMP_FILE..."
+                  echo "This may take 30-60 minutes depending on network speed (~40GB)"
+                  
+                  curl -L -C - -o "/dumps/$DUMP_FILE" "$INDEX_URL$DUMP_FILE"
+                  
+                  echo "Download complete!"
+                  ls -lh /dumps/
+                  chmod 644 /dumps/*.json.gz
+              securityContext:
+                runAsUser: 0
+                runAsGroup: 0
+              volumeMounts:
+                - name: wiki-dumps
+                  mountPath: /dumps
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+          containers:
+            - name: ray-head
+              # GPU image with sentence-transformers for embedding stage
+              image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+              env:
+                - name: RAY_memory_usage_threshold
+                  value: "0.95"
+              volumeMounts:
+                - name: wiki-dumps
+                  mountPath: /dumps
+                  readOnly: true
+                - name: wiki-output
+                  mountPath: /output
+          volumes:
+            - name: wiki-dumps
+              persistentVolumeClaim:
+                claimName: wiki-dumps
+            - name: wiki-output
+              persistentVolumeClaim:
+                claimName: wiki-output
+    workerGroupSpecs:
+      # CPU workers for tokenization stage
+      - groupName: cpu-workers
+        replicas: 4
+        minReplicas: 2
+        maxReplicas: 8
+        rayStartParams:
+          num-gpus: "0"
+          object-store-memory: "536870912"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-dumps
+                    mountPath: /dumps
+                    readOnly: true
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-dumps
+                persistentVolumeClaim:
+                  claimName: wiki-dumps
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+      # GPU workers for embedding stage
+      - groupName: gpu-workers
+        replicas: 1
+        minReplicas: 0
+        maxReplicas: 2
+        rayStartParams:
+          num-gpus: "1"
+          object-store-memory: "536870912"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:gpu-v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-dumps
+                    mountPath: /dumps
+                    readOnly: true
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-dumps
+                persistentVolumeClaim:
+                  claimName: wiki-dumps
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+
