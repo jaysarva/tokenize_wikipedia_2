@@ -1,0 +1,179 @@
+# RayJob for processing Wikipedia CirrusSearch dumps
+#
+# This job downloads CirrusSearch dump files (if not already present) and
+# tokenizes all articles using the streaming reader. Much faster than Live API
+# mode since there are no rate limits.
+#
+# Prerequisites:
+#   1. Create the dumps PVC: kubectl apply -n wiki-tokenizer -f k8s/pvc-dumps.yaml
+#   2. Create the output PVC: kubectl apply -n wiki-tokenizer -f k8s/pvc.yaml
+#
+# Usage:
+#   kubectl apply -n wiki-tokenizer -f k8s/rayjob-cirrus.yaml
+#
+# Monitor:
+#   kubectl get rayjob wiki-cirrus -n wiki-tokenizer -w
+#   kubectl logs -n wiki-tokenizer -l ray.io/node-type=head -f
+#
+# The init container downloads the dump file (~20GB) on first run.
+# Subsequent runs skip the download if the file already exists.
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: wiki-cirrus
+  namespace: wiki-tokenizer
+spec:
+  entrypoint: >
+    python -m ray_app.tokenize_wiki
+    --cirrus-dir /dumps
+    --output /output/token_counts.jsonl
+    --tokens-dir /output/tokens
+    --checkpoint /output/checkpoint.json
+    --concurrency 8
+  runtimeEnvYAML: |
+    env_vars:
+      TIKTOKEN_ENCODING: "cl100k_base"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: "2.9.3"
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        dashboard-port: "8265"
+        dashboard-agent-listen-port: "52365"
+        object-store-memory: "536870912"  # 512MB for larger workloads
+      template:
+        spec:
+          # Init container downloads CirrusSearch dump if not present
+          # Using alpine with curl (runs as root to handle NFS permissions)
+          initContainers:
+            - name: download-dumps
+              image: alpine:3.19
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  apk add --no-cache curl
+                  
+                  DUMP_BASE_URL="https://dumps.wikimedia.org/other/cirrussearch"
+                  
+                  # Check for existing dump files
+                  if ls /dumps/enwiki-*-cirrussearch-content.json.gz 1>/dev/null 2>&1; then
+                    echo "Dump file(s) already exist in /dumps, skipping download"
+                    ls -lh /dumps/*.json.gz
+                    exit 0
+                  fi
+                  
+                  echo "Finding latest dump date..."
+                  # Get the most recent date directory
+                  LATEST_DATE=$(curl -sL "$DUMP_BASE_URL/" | grep -oE '20[0-9]{6}' | sort -r | head -1)
+                  if [ -z "$LATEST_DATE" ]; then
+                    echo "ERROR: Could not determine latest dump date"
+                    exit 1
+                  fi
+                  echo "Latest dump date: $LATEST_DATE"
+                  
+                  INDEX_URL="$DUMP_BASE_URL/$LATEST_DATE/"
+                  
+                  # Get the dump filename
+                  DUMP_FILE=$(curl -sL "$INDEX_URL" | grep -oE 'enwiki-[0-9]+-cirrussearch-content\.json\.gz' | head -1)
+                  
+                  if [ -z "$DUMP_FILE" ]; then
+                    echo "ERROR: Could not find dump file in index"
+                    exit 1
+                  fi
+                  
+                  echo "Found dump file: $DUMP_FILE"
+                  echo "Downloading from $INDEX_URL$DUMP_FILE..."
+                  echo "This may take 30-60 minutes depending on network speed (~40GB)"
+                  
+                  # Download with progress and resume support
+                  curl -L -C - -o "/dumps/$DUMP_FILE" "$INDEX_URL$DUMP_FILE"
+                  
+                  echo "Download complete!"
+                  ls -lh /dumps/
+                  
+                  # Fix permissions so Ray containers can read the file
+                  chmod 644 /dumps/*.json.gz
+              securityContext:
+                runAsUser: 0
+                runAsGroup: 0
+              volumeMounts:
+                - name: wiki-dumps
+                  mountPath: /dumps
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+          containers:
+            - name: ray-head
+              image: "docker.io/jaysarva027/tokenize-wiki:v1"
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+              env:
+                - name: RAY_memory_usage_threshold
+                  value: "0.95"
+              volumeMounts:
+                - name: wiki-dumps
+                  mountPath: /dumps
+                  readOnly: true
+                - name: wiki-output
+                  mountPath: /output
+          volumes:
+            - name: wiki-dumps
+              persistentVolumeClaim:
+                claimName: wiki-dumps
+            - name: wiki-output
+              persistentVolumeClaim:
+                claimName: wiki-output
+    workerGroupSpecs:
+      - groupName: cirrus-workers
+        # Scale workers based on cluster size
+        # Each worker can handle multiple concurrent tokenization tasks
+        replicas: 4
+        minReplicas: 2
+        maxReplicas: 8
+        rayStartParams:
+          object-store-memory: "536870912"  # 512MB
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "docker.io/jaysarva027/tokenize-wiki:v1"
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                env:
+                  - name: RAY_memory_usage_threshold
+                    value: "0.95"
+                volumeMounts:
+                  - name: wiki-dumps
+                    mountPath: /dumps
+                    readOnly: true
+                  - name: wiki-output
+                    mountPath: /output
+            volumes:
+              - name: wiki-dumps
+                persistentVolumeClaim:
+                  claimName: wiki-dumps
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
+

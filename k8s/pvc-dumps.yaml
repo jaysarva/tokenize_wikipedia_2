@@ -1,0 +1,31 @@
+# PVC for storing CirrusSearch dump files
+#
+# This PVC stores the downloaded Wikipedia CirrusSearch dumps.
+# The English Wikipedia dump is ~20GB compressed, so we allocate 50Gi
+# to allow for multiple dumps or future growth.
+#
+# Usage:
+#   kubectl apply -n wiki-tokenizer -f k8s/pvc-dumps.yaml
+#
+# The init container in rayjob-cirrus.yaml will download dumps here.
+# Workers read from this PVC during processing.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wiki-dumps
+  namespace: wiki-tokenizer
+spec:
+  # Use NFS storage class for K3s cluster (provides ReadWriteMany)
+  # For minikube, comment out storageClassName to use default provisioner
+  # For cloud providers:
+  #   AWS EKS: efs-sc
+  #   GKE: filestore-sc
+  #   Azure: azurefile
+  storageClassName: nfs-csi
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+
