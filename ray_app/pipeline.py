@@ -33,37 +33,44 @@ log = logging.getLogger(__name__)
 def run_tokenization(args) -> bool:
     """Run the tokenization stage."""
     from ray_app.tokenize_wiki import main as tokenize_main
-    
+
     log.info("=" * 60)
     log.info("STAGE 1: TOKENIZATION")
     log.info("=" * 60)
-    
+
     tokenize_args = [
         "--output", str(args.output_dir / "token_counts.jsonl"),
         "--tokens-dir", str(args.output_dir / "tokens"),
         "--checkpoint", str(args.output_dir / "tokenize_checkpoint.json"),
         "--concurrency", str(args.tokenize_concurrency),
     ]
-    
+
     if args.pages_file:
         tokenize_args.extend(["--pages-file", args.pages_file])
     if args.pages:
         tokenize_args.extend(["--pages", args.pages])
     if args.max_pages:
         tokenize_args.extend(["--max-pages", str(args.max_pages)])
-    
+
     log.info(f"Tokenization args: {tokenize_args}")
-    
+
     try:
         exit_code = tokenize_main(tokenize_args)
         if exit_code != 0:
-            log.error(f"Tokenization failed with exit code {exit_code}")
-            return False
-        log.info("Tokenization completed successfully!")
-        return True
+            log.warning(f"Tokenization had errors (exit code {exit_code})")
     except Exception as e:
-        log.error(f"Tokenization failed with exception: {e}")
+        log.warning(f"Tokenization exception: {e}")
+
+    # Check if any tokens were actually created
+    tokens_dir = args.output_dir / "tokens"
+    token_files = list(tokens_dir.glob("*.json")) if tokens_dir.exists() else []
+
+    if not token_files:
+        log.error("No token files created - cannot proceed to embedding")
         return False
+
+    log.info(f"Tokenization produced {len(token_files)} token files")
+    return True
 
 
 def run_embedding(args) -> bool:

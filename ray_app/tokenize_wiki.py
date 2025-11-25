@@ -352,7 +352,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{stats['skipped']} pages skipped (output already exists).")
     if stats["errors"]:
         print(f"{stats['errors']} pages failed; check output for details.")
-    return 0 if stats["errors"] == 0 else 1
+
+    # Only fail if NO pages succeeded (all failed or no pages processed)
+    if stats["ok"] == 0 and stats["skipped"] == 0:
+        print("FATAL: No pages were successfully tokenized!")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
