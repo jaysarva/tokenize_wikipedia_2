@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wiki-output
+  namespace: wiki-tokenizer
+spec:
+  # Use NFS storage class for K3s cluster (provides ReadWriteMany)
+  # For minikube, comment out storageClassName to use default provisioner
+  storageClassName: nfs-csi
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+

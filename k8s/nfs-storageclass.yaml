@@ -1,0 +1,20 @@
+# NFS StorageClass for K3s cluster.
+# This is applied automatically by scripts/setup_nfs_csi.sh, but kept here for reference.
+#
+# Before applying, update the server IP to match your NFS server (master node internal IP).
+# For your cluster: server: "10.19.49.195"
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-csi
+provisioner: nfs.csi.k8s.io
+parameters:
+  # Update this to your NFS server IP (master node internal IP)
+  server: "10.19.49.195"
+  share: "/srv/nfs/wiki-output"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1
+

@@ -10,4 +10,4 @@ if [[ -z "${HEAD_POD}" ]]; then
 fi
 
 echo "Head pod: $HEAD_POD"
-kubectl exec -n "$NAMESPACE" "$HEAD_POD" -- cat /tmp/token_counts.jsonl
+kubectl exec -n "$NAMESPACE" "$HEAD_POD" -- cat /output/token_counts.jsonl

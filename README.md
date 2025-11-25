@@ -54,12 +54,78 @@ kubectl apply -n wiki-tokenizer -f k8s/rayjob-toy.yaml
 kubectl get pods -n wiki-tokenizer
 kubectl logs -n wiki-tokenizer job-submit-rayjob-sample -f   # replace with the submitter pod name
 ```
-The job writes `/tmp/token_counts.jsonl` in the driver pod; for a real run, point `--output` at durable storage (object store, PVC, or shared FS).
+The job writes to a PersistentVolumeClaim mounted at `/output`, so results persist across pod restarts and job cleanup.
 If you change the user-agent value in `k8s/rayjob-toy.yaml`, keep it quoted because of the colon in the string.
 If you see OOM errors, lower `--concurrency` (toy job uses 1), cap object store memory (set in manifests to 256Mi), raise the `RAY_memory_usage_threshold` env (0.99), or increase worker memory limits.
-For durability on worker loss, set `--output-dir /durable/path` (PVC/object mount) to write per-page JSON files as tasks finish; tasks now retry up to 3 times on failure.
+Output is written to a PVC for durability; results survive pod restarts and job TTL cleanup. Tasks retry up to 3 times on failure.
+**Idempotent execution:** If you restart a failed job, pages that already have output files in `--tokens-dir` are automatically skipped (status: `skipped`). This allows resuming work without re-processing completed pages.
 
-## Minikube + KubeRay toy run (no registry needed)
+## K3s Cluster Deployment (Production)
+
+For a multi-node K3s cluster (e.g., 1 master + 2 workers):
+
+### Prerequisites
+- K3s cluster with all nodes joined (`kubectl get nodes` shows Ready)
+- Helm installed
+- Docker Hub account (or other container registry)
+
+### Setup Steps
+
+1) **Set up NFS server on master node** (provides ReadWriteMany storage):
+```bash
+# SSH to master node and run:
+sudo ./scripts/setup_nfs_server.sh
+
+# Install NFS client on worker nodes:
+sudo apt install -y nfs-common
+```
+
+2) **Install NFS CSI driver** (from any machine with kubectl access):
+```bash
+NFS_SERVER=10.19.49.195 ./scripts/setup_nfs_csi.sh  # Use master's internal IP
+```
+
+3) **Install KubeRay operator**:
+```bash
+./scripts/install_kuberay.sh
+```
+
+4) **Build and push Docker image**:
+```bash
+IMAGE_REGISTRY=docker.io/yourusername ./scripts/build_and_push.sh
+```
+
+5) **Update manifests** with your image registry:
+```bash
+# Edit k8s/rayjob-toy.yaml and k8s/raycluster.yaml
+# Replace DOCKERHUB_USERNAME with your actual username
+```
+
+6) **Deploy the job**:
+```bash
+./scripts/deploy_toy_job.sh
+```
+
+7) **Monitor and retrieve results**:
+```bash
+kubectl get pods -n wiki-tokenizer -w
+./scripts/watch_job.sh
+./scripts/get_job_output.sh
+```
+
+### One-liner setup (after NFS server is running):
+```bash
+export NFS_SERVER=10.19.49.195
+export IMAGE_REGISTRY=docker.io/yourusername
+./scripts/setup_k3s_cluster.sh
+./scripts/build_and_push.sh
+./scripts/deploy_toy_job.sh
+```
+
+---
+
+## Minikube + KubeRay toy run (local development)
+
 Helper scripts in `scripts/` automate these steps.
 1) Start Minikube with headroom:
 ```bash
@@ -69,7 +135,7 @@ scripts/minikube_start.sh
 ```bash
 scripts/install_kuberay.sh
 ```
-3) Build the image inside Minikube’s Docker (no push):
+3) Build the image inside Minikube's Docker (no push):
 ```bash
 scripts/build_image_local.sh
 ```
@@ -80,7 +146,13 @@ If you changed `requirements.txt` or the Dockerfile (to include wget/bash) or tw
 scripts/deploy_toy_job.sh
 ```
 If you edit `data/sample_pages.txt`, this script reapplies `k8s/pages-configmap.yaml` so pods see the updated list.
-6) Inspect output:
+This also creates a PVC (`wiki-output`) for persistent output storage.
+6) Wait for job completion:
+```bash
+scripts/watch_job.sh        # polls until SUCCEEDED/FAILED (default 600s timeout)
+scripts/watch_job.sh 300    # custom timeout
+```
+7) Inspect output:
 ```bash
 scripts/get_job_output.sh
 ```
@@ -90,7 +162,12 @@ To copy tokens locally:
 ```bash
 LOCAL_DIR=./tokens scripts/get_tokens.sh
 ```
-7) (Optional) Use the standalone RayCluster (`k8s/raycluster.yaml`) plus port-forward the dashboard:
+**One-liner for the full cycle** (deploy + wait + retrieve):
+```bash
+scripts/run_job.sh          # default 600s timeout
+scripts/run_job.sh 300      # custom timeout
+```
+9) (Optional) Use the standalone RayCluster (`k8s/raycluster.yaml`) plus port-forward the dashboard:
 ```bash
 kubectl apply -n wiki-tokenizer -f k8s/raycluster.yaml
 kubectl port-forward svc/wiki-raycluster-head-svc 8265:8265 -n wiki-tokenizer
@@ -99,7 +176,7 @@ Or, for the auto-created RayJob cluster, port-forward the head service automatic
 ```bash
 scripts/port_forward_dashboard.sh   # then visit http://localhost:8265
 ```
-8) Cleanup:
+10) Cleanup:
 ```bash
 kubectl delete ns wiki-tokenizer
 helm uninstall kuberay-operator -n ray-system
@@ -110,7 +187,7 @@ minikube stop
 ## Scaling up
 - **Page list:** Replace `k8s/pages-configmap.yaml` with your own list (newline-delimited titles). For millions of pages, store lists in object storage and change `--pages-file` to point at the mounted path or extend `ray_app/tokenize_wiki.py` to read from an object store iterator.
 - **Workers:** Adjust the `RayCluster` worker group replicas and resource requests. Increase `--concurrency` in `ray_app/tokenize_wiki.py` cautiously to respect Wikipedia API rate limits or switch to page dumps to avoid throttling. Failed pages are reported but do not stop the job.
-- **Fault tolerance:** `fetch_and_tokenize` has simple retries. Add caching or persist partial results to avoid re-processing on retries if desired.
+- **Fault tolerance:** `fetch_and_tokenize` has simple retries (up to 3 per task). Tasks are idempotent—if output already exists, the task is skipped. This allows safe job restarts without re-processing completed work.
 - **Observability:** Ray dashboard runs on the head pod (port 8265). Port-forward for inspection: `kubectl port-forward svc/wiki-raycluster-head-svc 8265:8265 -n wiki-tokenizer`.
 
 ## Repo layout

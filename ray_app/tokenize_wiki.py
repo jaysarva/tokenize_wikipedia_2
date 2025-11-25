@@ -7,7 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 import ray
 import requests
@@ -114,6 +114,17 @@ def fetch_and_tokenize(
     persist_dir: Optional[str],
     tokens_dir: Optional[str],
 ) -> Dict[str, object]:
+    # Skip if output already exists (idempotent task execution)
+    if tokens_dir:
+        output_path = Path(tokens_dir) / _slug_filename(title)
+        if output_path.exists():
+            return {
+                "title": title,
+                "status": "skipped",
+                "reason": "output_exists",
+                "tokens_path": str(output_path),
+            }
+
     start = time.time()
     try:
         text = fetch_plaintext(title, endpoint, user_agent=user_agent)
@@ -155,6 +166,39 @@ def write_jsonl(path: str, rows: Iterable[Dict[str, object]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_checkpoint(checkpoint_path: Optional[str]) -> Set[str]:
+    """Load completed titles from checkpoint file."""
+    if not checkpoint_path:
+        return set()
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+        completed = set(data.get("completed", []))
+        print(f"Loaded checkpoint with {len(completed)} completed titles")
+        return completed
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not load checkpoint {checkpoint_path}: {e}")
+        return set()
+
+
+def save_checkpoint(checkpoint_path: Optional[str], completed_titles: List[str]) -> None:
+    """Save completed titles to checkpoint file (atomic write)."""
+    if not checkpoint_path:
+        return
+    path = Path(checkpoint_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    data = {
+        "completed": completed_titles,
+        "count": len(completed_titles),
+        "timestamp": time.time(),
+    }
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    tmp.replace(path)
+
+
 def process_titles(
     titles: List[str],
     endpoint: str,
@@ -163,29 +207,42 @@ def process_titles(
     user_agent: str,
     persist_dir: Optional[str],
     tokens_dir: Optional[str],
+    checkpoint_path: Optional[str] = None,
     show_progress: bool = True,
 ) -> List[Dict[str, object]]:
     inflight: List[ray.ObjectRef] = []
     results: List[Dict[str, object]] = []
+    completed_titles: List[str] = []
     total = len(titles)
     completed = 0
     ok_count = 0
+    skipped_count = 0
     err_count = 0
+    checkpoint_interval = 10  # Save checkpoint every N completions
 
     def log_progress(batch: List[Dict[str, object]]) -> None:
-        nonlocal completed, ok_count, err_count
+        nonlocal completed, ok_count, skipped_count, err_count
         for row in batch:
             completed += 1
-            if row.get("status") == "ok":
+            status = row.get("status")
+            title = str(row.get("title", ""))
+            if status == "ok":
                 ok_count += 1
+                completed_titles.append(title)
+            elif status == "skipped":
+                skipped_count += 1
+                completed_titles.append(title)  # Still counts as done
             else:
                 err_count += 1
         if show_progress and batch:
             last = batch[-1]
             print(
-                f"[{completed}/{total}] ok={ok_count} err={err_count} last={last.get('title')} ({last.get('status')})",
+                f"[{completed}/{total}] ok={ok_count} skip={skipped_count} err={err_count} last={last.get('title')} ({last.get('status')})",
                 flush=True,
             )
+        # Save checkpoint periodically
+        if checkpoint_path and completed % checkpoint_interval == 0:
+            save_checkpoint(checkpoint_path, completed_titles)
 
     for title in titles:
         inflight.append(fetch_and_tokenize.remote(title, endpoint, encoding_name, user_agent, persist_dir, tokens_dir))
@@ -199,16 +256,23 @@ def process_titles(
         batch_rows = ray.get(ready)
         results.extend(batch_rows)
         log_progress(batch_rows)
+
+    # Final checkpoint save
+    if checkpoint_path:
+        save_checkpoint(checkpoint_path, completed_titles)
+
     return results
 
 
 def summarize(rows: List[Dict[str, object]]) -> Dict[str, object]:
     ok_rows = [r for r in rows if r.get("status") == "ok"]
-    errors = [r for r in rows if r.get("status") != "ok"]
+    skipped = [r for r in rows if r.get("status") == "skipped"]
+    errors = [r for r in rows if r.get("status") not in ("ok", "skipped")]
     total_tokens = sum(r["token_count"] for r in ok_rows)
     return {
         "pages": len(rows),
         "ok": len(ok_rows),
+        "skipped": len(skipped),
         "errors": len(errors),
         "total_tokens": total_tokens,
     }
@@ -231,6 +295,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--tokens-dir",
         help="Optional directory to persist per-page token payloads as they complete (use a durable PVC/object mount in K8s).",
     )
+    parser.add_argument(
+        "--checkpoint",
+        help="Path to checkpoint file for resume support (e.g., /output/checkpoint.json).",
+    )
     args = parser.parse_args(argv)
 
     titles = load_titles(args)
@@ -239,6 +307,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not titles:
         print("No pages provided.")
         return 1
+
+    # Load checkpoint and filter out already completed titles
+    already_completed = load_checkpoint(args.checkpoint)
+    original_count = len(titles)
+    if already_completed:
+        titles = [t for t in titles if t not in already_completed]
+        skipped_from_checkpoint = original_count - len(titles)
+        if skipped_from_checkpoint > 0:
+            print(f"Skipping {skipped_from_checkpoint} pages from checkpoint (already completed)")
+
+    if not titles:
+        print("All pages already completed (from checkpoint). Nothing to do.")
+        return 0
 
     # Connect to the existing Ray cluster (RayJob sets this up).
     ray.init(address="auto")
@@ -251,6 +332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         USER_AGENT,
         args.output_dir,
         args.tokens_dir,
+        checkpoint_path=args.checkpoint,
         show_progress=True,
     )
     stats = summarize(rows)
@@ -258,6 +340,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(json.dumps(stats, indent=2))
     print(f"Wrote per-page stats to {args.output}")
+    if args.checkpoint:
+        print(f"Checkpoint saved to {args.checkpoint}")
+    if stats["skipped"]:
+        print(f"{stats['skipped']} pages skipped (output already exists).")
     if stats["errors"]:
         print(f"{stats['errors']} pages failed; check output for details.")
     return 0 if stats["errors"] == 0 else 1

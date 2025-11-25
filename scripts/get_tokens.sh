@@ -14,6 +14,6 @@ if [[ -z "${HEAD_POD}" ]]; then
 fi
 
 mkdir -p "$LOCAL_DIR"
-echo "Copying tokens from $HEAD_POD:/tmp/tokens to $LOCAL_DIR"
-kubectl cp -n "$NAMESPACE" "$HEAD_POD":/tmp/tokens "$LOCAL_DIR"
+echo "Copying tokens from $HEAD_POD:/output/tokens to $LOCAL_DIR"
+kubectl cp -n "$NAMESPACE" "$HEAD_POD":/output/tokens "$LOCAL_DIR"
 echo "Done. Local tokens dir: $LOCAL_DIR/tokens"

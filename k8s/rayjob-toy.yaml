@@ -7,9 +7,10 @@ spec:
   entrypoint: >
     python -m ray_app.tokenize_wiki
     --pages-file /data/sample_pages.txt
-    --output /tmp/token_counts.jsonl
-    --tokens-dir /tmp/tokens
-    --concurrency 1
+    --output /output/token_counts.jsonl
+    --tokens-dir /output/tokens
+    --checkpoint /output/checkpoint.json
+    --concurrency 4
   runtimeEnvYAML: |
     env_vars:
       WIKI_API_ENDPOINT: "https://en.wikipedia.org/w/api.php"
@@ -29,8 +30,10 @@ spec:
         spec:
           containers:
             - name: ray-head
-              image: "tokenize-wiki:local"
-              imagePullPolicy: IfNotPresent
+              # Update DOCKERHUB_USERNAME to your Docker Hub username
+              # Or use full registry path: ghcr.io/org/tokenize-wiki:v1
+              image: "docker.io/DOCKERHUB_USERNAME/tokenize-wiki:v1"
+              imagePullPolicy: Always
               resources:
                 requests:
                   cpu: "1"
@@ -44,24 +47,31 @@ spec:
               volumeMounts:
                 - name: wiki-pages
                   mountPath: /data
+                - name: wiki-output
+                  mountPath: /output
           volumes:
             - name: wiki-pages
               configMap:
                 name: wiki-page-list
                 optional: true
+            - name: wiki-output
+              persistentVolumeClaim:
+                claimName: wiki-output
     workerGroupSpecs:
       - groupName: toy-workers
-        replicas: 1
-        minReplicas: 1
-        maxReplicas: 2
+        # 2 workers to utilize both worker nodes (master runs head pod)
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 4
         rayStartParams:
           object-store-memory: "268435456"
         template:
           spec:
             containers:
               - name: ray-worker
-                image: "tokenize-wiki:local"
-                imagePullPolicy: IfNotPresent
+                # Update DOCKERHUB_USERNAME to your Docker Hub username
+                image: "docker.io/DOCKERHUB_USERNAME/tokenize-wiki:v1"
+                imagePullPolicy: Always
                 resources:
                   requests:
                     cpu: "1"
@@ -75,8 +85,13 @@ spec:
                 volumeMounts:
                   - name: wiki-pages
                     mountPath: /data
+                  - name: wiki-output
+                    mountPath: /output
             volumes:
               - name: wiki-pages
                 configMap:
                   name: wiki-page-list
                   optional: true
+              - name: wiki-output
+                persistentVolumeClaim:
+                  claimName: wiki-output
